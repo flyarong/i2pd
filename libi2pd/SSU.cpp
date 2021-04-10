@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2020, The PurpleI2P Project
+* Copyright (c) 2013-2021, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -7,44 +7,30 @@
 */
 
 #include <string.h>
-#include <boost/bind.hpp>
 #include "Log.h"
 #include "Timestamp.h"
 #include "RouterContext.h"
 #include "NetDb.hpp"
 #include "SSU.h"
+#include "util.h"
+
+#ifdef _WIN32
+#include <boost/winapi/error_codes.hpp>
+#endif
 
 namespace i2p
 {
 namespace transport
 {
-
-	SSUServer::SSUServer (const boost::asio::ip::address & addr, int port):
-		m_OnlyV6(true), m_IsRunning(false),
-		m_Thread (nullptr), m_ThreadV6 (nullptr), m_ReceiversThread (nullptr),
-		m_ReceiversThreadV6 (nullptr), m_Work (m_Service), m_WorkV6 (m_ServiceV6),
-		m_ReceiversWork (m_ReceiversService), m_ReceiversWorkV6 (m_ReceiversServiceV6),
-		m_EndpointV6 (addr, port), m_Socket (m_ReceiversService, m_Endpoint),
-		m_SocketV6 (m_ReceiversServiceV6), m_IntroducersUpdateTimer (m_Service),
-		m_PeerTestsCleanupTimer (m_Service), m_TerminationTimer (m_Service),
-		m_TerminationTimerV6 (m_ServiceV6)
-	{
-		OpenSocketV6 ();
-	}
-
 	SSUServer::SSUServer (int port):
-		m_OnlyV6(false), m_IsRunning(false),
-		m_Thread (nullptr), m_ThreadV6 (nullptr), m_ReceiversThread (nullptr),
-		m_ReceiversThreadV6 (nullptr), 	m_Work (m_Service), m_WorkV6 (m_ServiceV6),
+		m_IsRunning(false), m_Thread (nullptr),
+		m_ReceiversThread (nullptr), m_ReceiversThreadV6 (nullptr), m_Work (m_Service),
 		m_ReceiversWork (m_ReceiversService), m_ReceiversWorkV6 (m_ReceiversServiceV6),
 		m_Endpoint (boost::asio::ip::udp::v4 (), port), m_EndpointV6 (boost::asio::ip::udp::v6 (), port),
 		m_Socket (m_ReceiversService), m_SocketV6 (m_ReceiversServiceV6),
 		m_IntroducersUpdateTimer (m_Service), m_PeerTestsCleanupTimer (m_Service),
-		m_TerminationTimer (m_Service), m_TerminationTimerV6 (m_ServiceV6)
+		m_TerminationTimer (m_Service), m_TerminationTimerV6 (m_Service)
 	{
-		OpenSocket ();
-		if (context.SupportsV6 ())
-			OpenSocketV6 ();
 	}
 
 	SSUServer::~SSUServer ()
@@ -89,17 +75,18 @@ namespace transport
 	void SSUServer::Start ()
 	{
 		m_IsRunning = true;
-		if (!m_OnlyV6)
+		m_Thread = new std::thread (std::bind (&SSUServer::Run, this));
+		if (context.SupportsV4 ())
 		{
-			m_ReceiversThread = new std::thread (std::bind (&SSUServer::RunReceivers, this));
-			m_Thread = new std::thread (std::bind (&SSUServer::Run, this));
+			OpenSocket ();
+			m_ReceiversThread = new std::thread (std::bind (&SSUServer::RunReceivers, this));		
 			m_ReceiversService.post (std::bind (&SSUServer::Receive, this));
 			ScheduleTermination ();
 		}
 		if (context.SupportsV6 ())
 		{
+			OpenSocketV6 ();
 			m_ReceiversThreadV6 = new std::thread (std::bind (&SSUServer::RunReceiversV6, this));
-			m_ThreadV6 = new std::thread (std::bind (&SSUServer::RunV6, this));
 			m_ReceiversServiceV6.post (std::bind (&SSUServer::ReceiveV6, this));
 			ScheduleTerminationV6 ();
 		}
@@ -115,7 +102,6 @@ namespace transport
 		m_TerminationTimerV6.cancel ();
 		m_Service.stop ();
 		m_Socket.close ();
-		m_ServiceV6.stop ();
 		m_SocketV6.close ();
 		m_ReceiversService.stop ();
 		m_ReceiversServiceV6.stop ();
@@ -125,28 +111,24 @@ namespace transport
 			delete m_ReceiversThread;
 			m_ReceiversThread = nullptr;
 		}
-		if (m_Thread)
-		{
-			m_Thread->join ();
-			delete m_Thread;
-			m_Thread = nullptr;
-		}
 		if (m_ReceiversThreadV6)
 		{
 			m_ReceiversThreadV6->join ();
 			delete m_ReceiversThreadV6;
 			m_ReceiversThreadV6 = nullptr;
 		}
-		if (m_ThreadV6)
+		if (m_Thread)
 		{
-			m_ThreadV6->join ();
-			delete m_ThreadV6;
-			m_ThreadV6 = nullptr;
-		}
+			m_Thread->join ();
+			delete m_Thread;
+			m_Thread = nullptr;
+		}	
 	}
 
 	void SSUServer::Run ()
 	{
+		i2p::util::SetThreadName("SSU");
+
 		while (m_IsRunning)
 		{
 			try
@@ -160,23 +142,10 @@ namespace transport
 		}
 	}
 
-	void SSUServer::RunV6 ()
-	{
-		while (m_IsRunning)
-		{
-			try
-			{
-				m_ServiceV6.run ();
-			}
-			catch (std::exception& ex)
-			{
-				LogPrint (eLogError, "SSU: v6 server runtime exception: ", ex.what ());
-			}
-		}
-	}
-
 	void SSUServer::RunReceivers ()
 	{
+		i2p::util::SetThreadName("SSUv4");
+
 		while (m_IsRunning)
 		{
 			try
@@ -199,6 +168,8 @@ namespace transport
 
 	void SSUServer::RunReceiversV6 ()
 	{
+		i2p::util::SetThreadName("SSUv6");
+
 		while (m_IsRunning)
 		{
 			try
@@ -218,6 +189,14 @@ namespace transport
 		}
 	}
 
+	void SSUServer::SetLocalAddress (const boost::asio::ip::address& localAddress)
+	{
+		if (localAddress.is_v6 ())
+			m_EndpointV6.address (localAddress);
+		else if (localAddress.is_v4 ())
+			m_Endpoint.address (localAddress);
+	}	
+		
 	void SSUServer::AddRelay (uint32_t tag, std::shared_ptr<SSUSession> relay)
 	{
 		m_Relays[tag] = relay;
@@ -243,10 +222,16 @@ namespace transport
 
 	void SSUServer::Send (const uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& to)
 	{
+		boost::system::error_code ec;
 		if (to.protocol () == boost::asio::ip::udp::v4())
-			m_Socket.send_to (boost::asio::buffer (buf, len), to);
+			m_Socket.send_to (boost::asio::buffer (buf, len), to, 0, ec);
 		else
-			m_SocketV6.send_to (boost::asio::buffer (buf, len), to);
+			m_SocketV6.send_to (boost::asio::buffer (buf, len), to, 0, ec);
+
+		if (ec)
+		{
+			LogPrint (eLogError, "SSU: send exception: ", ec.message (), " while trying to send data to ", to.address (), ":", to.port (), " (length: ", len, ")");
+		}
 	}
 
 	void SSUServer::Receive ()
@@ -265,7 +250,19 @@ namespace transport
 
 	void SSUServer::HandleReceivedFrom (const boost::system::error_code& ecode, std::size_t bytes_transferred, SSUPacket * packet)
 	{
-		if (!ecode)
+		if (!ecode
+		    || ecode == boost::asio::error::connection_refused
+		    || ecode == boost::asio::error::connection_reset
+		    || ecode == boost::asio::error::network_unreachable
+		    || ecode == boost::asio::error::host_unreachable
+#ifdef _WIN32 // windows can throw WinAPI error, which is not handled by ASIO
+		    || ecode.value() == boost::winapi::ERROR_CONNECTION_REFUSED_
+		    || ecode.value() == boost::winapi::ERROR_NETWORK_UNREACHABLE_
+		    || ecode.value() == boost::winapi::ERROR_HOST_UNREACHABLE_
+#endif
+		)
+		// just try continue reading when received ICMP response otherwise socket can crash,
+		// but better to find out which host were sent it and mark that router as unreachable
 		{
 			packet->len = bytes_transferred;
 			std::vector<SSUPacket *> packets;
@@ -287,7 +284,7 @@ namespace transport
 					}
 					else
 					{
-						LogPrint (eLogError, "SSU: receive_from error: ", ec.message ());
+						LogPrint (eLogError, "SSU: receive_from error: code ", ec.value(), ": ", ec.message ());
 						delete packet;
 						break;
 					}
@@ -302,7 +299,7 @@ namespace transport
 			delete packet;
 			if (ecode != boost::asio::error::operation_aborted)
 			{
-				LogPrint (eLogError, "SSU: receive error: ", ecode.message ());
+				LogPrint (eLogError, "SSU: receive error: code ", ecode.value(), ": ", ecode.message ());
 				m_Socket.close ();
 				OpenSocket ();
 				Receive ();
@@ -312,7 +309,19 @@ namespace transport
 
 	void SSUServer::HandleReceivedFromV6 (const boost::system::error_code& ecode, std::size_t bytes_transferred, SSUPacket * packet)
 	{
-		if (!ecode)
+		if (!ecode
+		    || ecode == boost::asio::error::connection_refused
+		    || ecode == boost::asio::error::connection_reset
+		    || ecode == boost::asio::error::network_unreachable
+		    || ecode == boost::asio::error::host_unreachable
+#ifdef _WIN32 // windows can throw WinAPI error, which is not handled by ASIO
+		    || ecode.value() == boost::winapi::ERROR_CONNECTION_REFUSED_
+		    || ecode.value() == boost::winapi::ERROR_NETWORK_UNREACHABLE_
+		    || ecode.value() == boost::winapi::ERROR_HOST_UNREACHABLE_
+#endif
+		)
+		// just try continue reading when received ICMP response otherwise socket can crash,
+		// but better to find out which host were sent it and mark that router as unreachable
 		{
 			packet->len = bytes_transferred;
 			std::vector<SSUPacket *> packets;
@@ -334,14 +343,14 @@ namespace transport
 					}
 					else
 					{
-						LogPrint (eLogError, "SSU: v6 receive_from error: ", ec.message ());
+						LogPrint (eLogError, "SSU: v6 receive_from error: code ", ec.value(), ": ", ec.message ());
 						delete packet;
 						break;
 					}
 				}
 			}
 
-			m_ServiceV6.post (std::bind (&SSUServer::HandleReceivedPackets, this, packets, &m_SessionsV6));
+			m_Service.post (std::bind (&SSUServer::HandleReceivedPackets, this, packets, &m_SessionsV6));
 			ReceiveV6 ();
 		}
 		else
@@ -349,7 +358,7 @@ namespace transport
 			delete packet;
 			if (ecode != boost::asio::error::operation_aborted)
 			{
-				LogPrint (eLogError, "SSU: v6 receive error: ", ecode.message ());
+				LogPrint (eLogError, "SSU: v6 receive error: code ", ecode.value(), ": ", ecode.message ());
 				m_SocketV6.close ();
 				OpenSocketV6 ();
 				ReceiveV6 ();
@@ -360,6 +369,7 @@ namespace transport
 	void SSUServer::HandleReceivedPackets (std::vector<SSUPacket *> packets,
 		std::map<boost::asio::ip::udp::endpoint, std::shared_ptr<SSUSession> > * sessions)
 	{
+		if (!m_IsRunning) return;
 		std::shared_ptr<SSUSession> session;
 		for (auto& packet: packets)
 		{
@@ -375,7 +385,7 @@ namespace transport
 					auto it = sessions->find (packet->from);
 					if (it != sessions->end ())
 						session = it->second;
-					if (!session)
+					if (!session && packet->len > 0)
 					{
 						session = std::make_shared<SSUSession> (*this, packet->from);
 						session->WaitForConnect ();
@@ -383,7 +393,8 @@ namespace transport
 						LogPrint (eLogDebug, "SSU: new session from ", packet->from.address ().to_string (), ":", packet->from.port (), " created");
 					}
 				}
-				session->ProcessNextMessage (packet->buf, packet->len, packet->from);
+				if (session)
+					session->ProcessNextMessage (packet->buf, packet->len, packet->from);
 			}
 			catch (std::exception& ex)
 			{
@@ -420,29 +431,33 @@ namespace transport
 			return nullptr;
 	}
 
-	void SSUServer::CreateSession (std::shared_ptr<const i2p::data::RouterInfo> router, bool peerTest, bool v4only)
+	bool SSUServer::CreateSession (std::shared_ptr<const i2p::data::RouterInfo> router, bool peerTest, bool v4only)
 	{
 		auto address = router->GetSSUAddress (v4only || !context.SupportsV6 ());
 		if (address)
-			CreateSession (router, address->host, address->port, peerTest);
+			return CreateSession (router, address, peerTest);
 		else
 			LogPrint (eLogWarning, "SSU: Router ", i2p::data::GetIdentHashAbbreviation (router->GetIdentHash ()), " doesn't have SSU address");
+		return false;
 	}
 
-	void SSUServer::CreateSession (std::shared_ptr<const i2p::data::RouterInfo> router,
-		const boost::asio::ip::address& addr, int port, bool peerTest)
+	bool SSUServer::CreateSession (std::shared_ptr<const i2p::data::RouterInfo> router,
+		std::shared_ptr<const i2p::data::RouterInfo::Address> address, bool peerTest)
 	{
-		if (router)
+		if (router && address)
 		{
-			if (router->UsesIntroducer ())
-				m_Service.post (std::bind (&SSUServer::CreateSessionThroughIntroducer, this, router, peerTest)); // always V4 thread
+			if (address->UsesIntroducer ())
+				m_Service.post (std::bind (&SSUServer::CreateSessionThroughIntroducer, this, router, address, peerTest)); // always V4 thread
 			else
 			{
-				boost::asio::ip::udp::endpoint remoteEndpoint (addr, port);
-				auto& s = addr.is_v6 () ? m_ServiceV6 : m_Service;
-				s.post (std::bind (&SSUServer::CreateDirectSession, this, router, remoteEndpoint, peerTest));
+				if (address->host.is_unspecified ()) return false;	
+				boost::asio::ip::udp::endpoint remoteEndpoint (address->host, address->port);
+				m_Service.post (std::bind (&SSUServer::CreateDirectSession, this, router, remoteEndpoint, peerTest));
 			}
 		}
+		else
+			return false;
+		return true;
 	}
 
 	void SSUServer::CreateDirectSession (std::shared_ptr<const i2p::data::RouterInfo> router, boost::asio::ip::udp::endpoint remoteEndpoint, bool peerTest)
@@ -460,6 +475,7 @@ namespace transport
 			// otherwise create new session
 			auto session = std::make_shared<SSUSession> (*this, remoteEndpoint, router, peerTest);
 			sessions[remoteEndpoint] = session;
+
 			// connect
 			LogPrint (eLogDebug, "SSU: Creating new session to [", i2p::data::GetIdentHashAbbreviation (router->GetIdentHash ()), "] ",
 				remoteEndpoint.address ().to_string (), ":", remoteEndpoint.port ());
@@ -467,87 +483,107 @@ namespace transport
 		}
 	}
 
-	void SSUServer::CreateSessionThroughIntroducer (std::shared_ptr<const i2p::data::RouterInfo> router, bool peerTest)
+	void SSUServer::CreateSessionThroughIntroducer (std::shared_ptr<const i2p::data::RouterInfo> router, 
+		std::shared_ptr<const i2p::data::RouterInfo::Address> address, bool peerTest)
 	{
-		if (router && router->UsesIntroducer ())
-		{
-			auto address = router->GetSSUAddress (true); // v4 only for now
-			if (address)
-			{
+		if (router && address && address->UsesIntroducer ())
+		{	
+			if (address->IsV4 () && !i2p::context.SupportsV4 ()) return;
+			if (address->IsV6 () && !i2p::context.SupportsV6 ()) return;
+			if (!address->host.is_unspecified () && address->port)
+			{	
+				// we rarely come here
+				auto& sessions = address->host.is_v6 () ? m_SessionsV6 : m_Sessions;
 				boost::asio::ip::udp::endpoint remoteEndpoint (address->host, address->port);
-				auto it = m_Sessions.find (remoteEndpoint);
+				auto it = sessions.find (remoteEndpoint);
 				// check if session is presented already
-				if (it != m_Sessions.end ())
+				if (it != sessions.end ())
 				{
 					auto session = it->second;
 					if (peerTest && session->GetState () == eSessionStateEstablished)
 						session->SendPeerTest ();
 					return;
 				}
-				// create new session
-				int numIntroducers = address->ssu->introducers.size ();
-				if (numIntroducers > 0)
+			}	
+			// create new session
+			int numIntroducers = address->ssu->introducers.size ();
+			if (numIntroducers > 0)
+			{
+				uint32_t ts = i2p::util::GetSecondsSinceEpoch ();
+				std::shared_ptr<SSUSession> introducerSession;
+				const i2p::data::RouterInfo::Introducer * introducer = nullptr;
+				// we might have a session to introducer already
+				auto offset = rand ();
+				for (int i = 0; i < numIntroducers; i++)
 				{
-					uint32_t ts = i2p::util::GetSecondsSinceEpoch ();
-					std::shared_ptr<SSUSession> introducerSession;
-					const i2p::data::RouterInfo::Introducer * introducer = nullptr;
-					// we might have a session to introducer already
-					for (int i = 0; i < numIntroducers; i++)
+					auto intr = &(address->ssu->introducers[(offset + i)%numIntroducers]);
+					if (!intr->iPort) continue; // skip invalid introducer
+					if (intr->iExp > 0 && ts > intr->iExp) continue; // skip expired introducer
+					boost::asio::ip::udp::endpoint ep (intr->iHost, intr->iPort);
+					if (ep.address ().is_v4 () && address->IsV4 ()) // ipv4 
 					{
-						auto intr = &(address->ssu->introducers[i]);
-						if (intr->iExp > 0 && ts > intr->iExp) continue; // skip expired introducer
-						boost::asio::ip::udp::endpoint ep (intr->iHost, intr->iPort);
-						if (ep.address ().is_v4 ()) // ipv4 only
+						if (!introducer) introducer = intr; 
+						auto it = m_Sessions.find (ep);
+						if (it != m_Sessions.end ())
 						{
-							if (!introducer) introducer = intr; // we pick first one for now
-							it = m_Sessions.find (ep);
-							if (it != m_Sessions.end ())
-							{
-								introducerSession = it->second;
-								break;
-							}
+							introducerSession = it->second;
+							break;
 						}
 					}
-					if (!introducer)
+					if (ep.address ().is_v6 () && address->IsV6 ()) // ipv6 
 					{
-						LogPrint (eLogWarning, "SSU: Can't connect to unreachable router and no ipv4 non-expired introducers presented");
-						return;
-					}
-
-					if (introducerSession) // session found
-						LogPrint (eLogWarning, "SSU: Session to introducer already exists");
-					else // create new
-					{
-						LogPrint (eLogDebug, "SSU: Creating new session to introducer ", introducer->iHost);
-						boost::asio::ip::udp::endpoint introducerEndpoint (introducer->iHost, introducer->iPort);
-						introducerSession = std::make_shared<SSUSession> (*this, introducerEndpoint, router);
-						m_Sessions[introducerEndpoint] = introducerSession;
-					}
-#if BOOST_VERSION >= 104900
-					if (!address->host.is_unspecified () && address->port)
-#endif
-					{
-						// create session
-						auto session = std::make_shared<SSUSession> (*this, remoteEndpoint, router, peerTest);
-						m_Sessions[remoteEndpoint] = session;
-
-						// introduce
-						LogPrint (eLogInfo, "SSU: Introduce new session to [", i2p::data::GetIdentHashAbbreviation (router->GetIdentHash ()),
-								"] through introducer ", introducer->iHost, ":", introducer->iPort);
-						session->WaitForIntroduction ();
-						if (i2p::context.GetRouterInfo ().UsesIntroducer ()) // if we are unreachable
+						if (!introducer) introducer = intr; 
+						auto it = m_SessionsV6.find (ep);
+						if (it != m_SessionsV6.end ())
 						{
-							uint8_t buf[1];
-							Send (buf, 0, remoteEndpoint); // send HolePunch
+							introducerSession = it->second;
+							break;
 						}
 					}
-					introducerSession->Introduce (*introducer, router);
 				}
-				else
-					LogPrint (eLogWarning, "SSU: Can't connect to unreachable router and no introducers present");
+				if (!introducer)
+				{
+					LogPrint (eLogWarning, "SSU: Can't connect to unreachable router and no compatibe non-expired introducers presented");
+					return;
+				}
+
+				if (introducerSession) // session found
+					LogPrint (eLogWarning, "SSU: Session to introducer already exists");
+				else // create new
+				{
+					LogPrint (eLogDebug, "SSU: Creating new session to introducer ", introducer->iHost);
+					boost::asio::ip::udp::endpoint introducerEndpoint (introducer->iHost, introducer->iPort);
+					introducerSession = std::make_shared<SSUSession> (*this, introducerEndpoint, router);
+					if (introducerEndpoint.address ().is_v4 ())
+						m_Sessions[introducerEndpoint] = introducerSession;
+					else if (introducerEndpoint.address ().is_v6 ())
+						m_SessionsV6[introducerEndpoint] = introducerSession;	
+				}
+				if (!address->host.is_unspecified () && address->port)
+				{
+					// create session
+					boost::asio::ip::udp::endpoint remoteEndpoint (address->host, address->port);
+					auto session = std::make_shared<SSUSession> (*this, remoteEndpoint, router, peerTest);
+					if (address->host.is_v4 ())
+						m_Sessions[remoteEndpoint] = session;
+					else if (address->host.is_v6 ())
+						m_SessionsV6[remoteEndpoint] = session;
+
+					// introduce
+					LogPrint (eLogInfo, "SSU: Introduce new session to [", i2p::data::GetIdentHashAbbreviation (router->GetIdentHash ()),
+							"] through introducer ", introducer->iHost, ":", introducer->iPort);
+					session->WaitForIntroduction ();
+					if ((address->host.is_v4 () && i2p::context.GetStatus () == eRouterStatusFirewalled) ||
+					    (address->host.is_v6 () && i2p::context.GetStatusV6 () == eRouterStatusFirewalled)) 
+					{
+						uint8_t buf[1];
+						Send (buf, 0, remoteEndpoint); // send HolePunch
+					}
+				}
+				introducerSession->Introduce (*introducer, router);
 			}
 			else
-				LogPrint (eLogWarning, "SSU: Router ", i2p::data::GetIdentHashAbbreviation (router->GetIdentHash ()), " doesn't have SSU address");
+				LogPrint (eLogWarning, "SSU: Can't connect to unreachable router and no introducers present");
 		}
 	}
 
@@ -646,6 +682,14 @@ namespace transport
 		return ret;
 	}
 
+	void SSUServer::RescheduleIntroducersUpdateTimer ()
+	{
+		m_IntroducersUpdateTimer.cancel ();
+		m_IntroducersUpdateTimer.expires_from_now (boost::posix_time::seconds(SSU_KEEP_ALIVE_INTERVAL/2));
+		m_IntroducersUpdateTimer.async_wait (std::bind (&SSUServer::HandleIntroducersUpdateTimer,
+			this, std::placeholders::_1));
+	}	
+		
 	void SSUServer::ScheduleIntroducersUpdateTimer ()
 	{
 		m_IntroducersUpdateTimer.expires_from_now (boost::posix_time::seconds(SSU_KEEP_ALIVE_INTERVAL));
@@ -664,9 +708,14 @@ namespace transport
 				ScheduleIntroducersUpdateTimer ();
 				return;
 			}
-			if (i2p::context.GetStatus () == eRouterStatusOK) return; // we don't need introducers anymore
+			if (i2p::context.GetStatus () != eRouterStatusFirewalled)
+			{	
+				// we don't need introducers
+				m_Introducers.clear ();
+				return; 
+			}	
 			// we are firewalled
-			if (!i2p::context.IsUnreachable ()) i2p::context.SetUnreachable ();
+			if (!i2p::context.IsUnreachable ()) i2p::context.SetUnreachable (true, false); // ipv4
 			std::list<boost::asio::ip::udp::endpoint> newList;
 			size_t numIntroducers = 0;
 			uint32_t ts = i2p::util::GetSecondsSinceEpoch ();
@@ -695,6 +744,7 @@ namespace transport
 					introducer.iPort = ep.port ();
 					introducer.iTag = it1->GetRelayTag ();
 					introducer.iKey = it1->GetIntroKey ();
+					introducer.iExp = it1->GetCreationTime () + SSU_TO_INTRODUCER_SESSION_DURATION;
 					if (i2p::context.AddIntroducer (introducer))
 					{
 						newList.push_back (ep);
@@ -705,9 +755,24 @@ namespace transport
 			m_Introducers = newList;
 			if (m_Introducers.size () < SSU_MAX_NUM_INTRODUCERS)
 			{
-				auto introducer = i2p::data::netdb.GetRandomIntroducer ();
-				if (introducer)
-					CreateSession (introducer);
+				std::set<std::shared_ptr<const i2p::data::RouterInfo> > requested;
+				for (auto i = m_Introducers.size (); i < SSU_MAX_NUM_INTRODUCERS; i++)
+				{	
+					auto introducer = i2p::data::netdb.GetRandomIntroducer ();
+					if (introducer && !requested.count (introducer)) // not requested already
+					{	
+						auto address = introducer->GetSSUAddress (true); // v4
+						if (address && !address->host.is_unspecified ())
+						{
+							boost::asio::ip::udp::endpoint ep (address->host, address->port);
+							if (std::find (m_Introducers.begin (), m_Introducers.end (), ep) == m_Introducers.end ()) // not connected yet
+							{	
+								CreateDirectSession  (introducer, ep, false);
+								requested.insert (introducer);
+							}	
+						}	
+					}	
+				}	
 			}
 			ScheduleIntroducersUpdateTimer ();
 		}
@@ -823,7 +888,7 @@ namespace transport
 					auto session = it.second;
 					if (it.first != session->GetRemoteEndpoint ())
 						LogPrint (eLogWarning, "SSU: remote endpoint ", session->GetRemoteEndpoint (), " doesn't match key ", it.first);
-					m_ServiceV6.post ([session]
+					m_Service.post ([session]
 						{
 							LogPrint (eLogWarning, "SSU: no activity with ", session->GetRemoteEndpoint (), " for ", session->GetTerminationTimeout (), " seconds");
 							session->Failed ();

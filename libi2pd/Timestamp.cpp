@@ -18,8 +18,9 @@
 #include "Log.h"
 #include "I2PEndian.h"
 #include "Timestamp.h"
+#include "util.h"
 
-#ifdef WIN32
+#ifdef _WIN32
 	#ifndef _WIN64
 		#define _USE_32BIT_TIME_T
 	#endif
@@ -35,15 +36,21 @@ namespace util
 			std::chrono::system_clock::now().time_since_epoch()).count ();
 	}
 
-	static uint32_t GetLocalHoursSinceEpoch ()
-	{
-		return std::chrono::duration_cast<std::chrono::hours>(
-			std::chrono::system_clock::now().time_since_epoch()).count ();
-	}
-
 	static uint64_t GetLocalSecondsSinceEpoch ()
 	{
 		return std::chrono::duration_cast<std::chrono::seconds>(
+			std::chrono::system_clock::now().time_since_epoch()).count ();
+	}
+
+	static uint32_t GetLocalMinutesSinceEpoch ()
+	{
+		return std::chrono::duration_cast<std::chrono::minutes>(
+			std::chrono::system_clock::now().time_since_epoch()).count ();
+	}
+	
+	static uint32_t GetLocalHoursSinceEpoch ()
+	{
+		return std::chrono::duration_cast<std::chrono::hours>(
 			std::chrono::system_clock::now().time_since_epoch()).count ();
 	}
 
@@ -142,6 +149,8 @@ namespace util
 
 	void NTPTimeSync::Run ()
 	{
+		i2p::util::SetThreadName("Timesync");
+
 		while (m_IsRunning)
 		{
 			try
@@ -178,14 +187,19 @@ namespace util
 		return GetLocalMillisecondsSinceEpoch () + g_TimeOffset*1000;
 	}
 
-	uint32_t GetHoursSinceEpoch ()
-	{
-		return GetLocalHoursSinceEpoch () + g_TimeOffset/3600;
-	}
-
 	uint64_t GetSecondsSinceEpoch ()
 	{
 		return GetLocalSecondsSinceEpoch () + g_TimeOffset;
+	}	
+	
+	uint32_t GetMinutesSinceEpoch ()
+	{
+		return GetLocalMinutesSinceEpoch () + g_TimeOffset/60;
+	}
+	
+	uint32_t GetHoursSinceEpoch ()
+	{
+		return GetLocalHoursSinceEpoch () + g_TimeOffset/3600;
 	}
 
 	void GetCurrentDate (char * date)

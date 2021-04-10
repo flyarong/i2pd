@@ -11,7 +11,7 @@
 
 #include <inttypes.h>
 #include <string.h>
-#include <map>
+#include <unordered_map>
 #include <vector>
 #include <unordered_set>
 #include <memory>
@@ -75,9 +75,11 @@ namespace transport
 		std::shared_ptr<I2NPMessage> msg;
 		int nextFragmentNum;
 		uint32_t lastFragmentInsertTime; // in seconds
+		uint64_t receivedFragmentsBits;
 		std::set<std::unique_ptr<Fragment>, FragmentCmp> savedFragments;
 
-		IncompleteMessage (std::shared_ptr<I2NPMessage> m): msg (m), nextFragmentNum (0), lastFragmentInsertTime (0) {};
+		IncompleteMessage (std::shared_ptr<I2NPMessage> m): msg (m), nextFragmentNum (0), 
+			lastFragmentInsertTime (0), receivedFragmentsBits (0) {};
 		void AttachNextFragment (const uint8_t * fragment, size_t fragmentSize);
 	};
 
@@ -109,7 +111,7 @@ namespace transport
 		private:
 
 			void SendMsgAck (uint32_t msgID);
-			void SendFragmentAck (uint32_t msgID, int fragmentNum);
+			void SendFragmentAck (uint32_t msgID, uint64_t bits);
 			void ProcessAcks (uint8_t *& buf, uint8_t flag);
 			void ProcessFragments (uint8_t * buf);
 			void ProcessSentMessageAck (uint32_t msgID);
@@ -124,8 +126,8 @@ namespace transport
 		private:
 
 			SSUSession& m_Session;
-			std::map<uint32_t, std::unique_ptr<IncompleteMessage> > m_IncompleteMessages;
-			std::map<uint32_t, std::unique_ptr<SentMessage> > m_SentMessages;
+			std::unordered_map<uint32_t, std::unique_ptr<IncompleteMessage> > m_IncompleteMessages;
+			std::unordered_map<uint32_t, std::unique_ptr<SentMessage> > m_SentMessages;
 			std::unordered_set<uint32_t> m_ReceivedMessages;
 			boost::asio::deadline_timer m_ResendTimer, m_IncompleteMessagesCleanupTimer;
 			int m_MaxPacketSize, m_PacketSize;

@@ -21,6 +21,11 @@
 
 namespace i2p
 {
+namespace garlic
+{
+	class RouterIncomingRatchetSession;
+}	
+
 	const char ROUTER_INFO[] = "router.info";
 	const char ROUTER_KEYS[] = "router.keys";
 	const char NTCP2_KEYS[] = "ntcp2.keys";
@@ -31,15 +36,20 @@ namespace i2p
 		eRouterStatusOK = 0,
 		eRouterStatusTesting = 1,
 		eRouterStatusFirewalled = 2,
-		eRouterStatusError = 3
+		eRouterStatusError = 3,
+		eRouterStatusUnknown = 4,
+		eRouterStatusProxy = 5,
+		eRouterStatusMesh = 6	
 	};
 
 	enum RouterError
 	{
 		eRouterErrorNone = 0,
-		eRouterErrorClockSkew = 1
+		eRouterErrorClockSkew = 1,
+		eRouterErrorOffline = 2,
+		eRouterErrorSymmetricNAT = 3
 	};
-
+	
 	class RouterContext: public i2p::garlic::GarlicDestination
 	{
 		private:
@@ -81,20 +91,22 @@ namespace i2p
 			void SetStatus (RouterStatus status);
 			RouterError GetError () const { return m_Error; };
 			void SetError (RouterError error) { m_Status = eRouterStatusError; m_Error = error; };
+			RouterStatus GetStatusV6 () const { return m_StatusV6; };
+			void SetStatusV6 (RouterStatus status);
 			int GetNetID () const { return m_NetID; };
 			void SetNetID (int netID) { m_NetID = netID; };
-			bool DecryptTunnelBuildRecord (const uint8_t * encrypted, uint8_t * data, BN_CTX * ctx) const;
+			bool DecryptTunnelBuildRecord (const uint8_t * encrypted, uint8_t * data);
 
 			void UpdatePort (int port); // called from Daemon
 			void UpdateAddress (const boost::asio::ip::address& host);	// called from SSU or Daemon
-			void PublishNTCP2Address (int port, bool publish = true, bool v4only = false);
+			void PublishNTCP2Address (int port, bool publish, bool v4, bool v6, bool ygg);
 			void UpdateNTCP2Address (bool enable);
-			void PublishNTCPAddress (bool publish, bool v4only = true);
+			void RemoveNTCPAddress (bool v4only = true); // delete NTCP address for older routers. TODO: remove later
 			bool AddIntroducer (const i2p::data::RouterInfo::Introducer& introducer);
 			void RemoveIntroducer (const boost::asio::ip::udp::endpoint& e);
 			bool IsUnreachable () const;
-			void SetUnreachable ();
-			void SetReachable ();
+			void SetUnreachable (bool v4, bool v6);
+			void SetReachable (bool v4, bool v6);
 			bool IsFloodfill () const { return m_IsFloodfill; };
 			void SetFloodfill (bool floodfill);
 			void SetFamily (const std::string& family);
@@ -106,9 +118,13 @@ namespace i2p
 			void SetAcceptsTunnels (bool acceptsTunnels) { m_AcceptsTunnels = acceptsTunnels; };
 			bool SupportsV6 () const { return m_RouterInfo.IsV6 (); };
 			bool SupportsV4 () const { return m_RouterInfo.IsV4 (); };
+			bool SupportsMesh () const { return m_RouterInfo.IsMesh (); };
 			void SetSupportsV6 (bool supportsV6);
 			void SetSupportsV4 (bool supportsV4);
-
+			void SetSupportsMesh (bool supportsmesh, const boost::asio::ip::address_v6& host);
+			bool IsECIES () const { return GetIdentity ()->GetCryptoKeyType () == i2p::data::CRYPTO_KEY_TYPE_ECIES_X25519_AEAD; };
+			std::unique_ptr<i2p::crypto::NoiseSymmetricState>& GetCurrentNoiseState () { return m_CurrentNoiseState; };
+			
 			void UpdateNTCP2V6Address (const boost::asio::ip::address& host); // called from Daemon. TODO: remove
 			void UpdateStats ();
 			void UpdateTimestamp (uint64_t ts); // in seconds, called from NetDb before publishing
@@ -132,7 +148,7 @@ namespace i2p
 
 			// implements GarlicDestination
 			void HandleI2NPMessage (const uint8_t * buf, size_t len);
-			bool HandleCloveI2NPMessage (I2NPMessageType typeID, const uint8_t * payload, size_t len) { return false; }; // not implemented
+			bool HandleCloveI2NPMessage (I2NPMessageType typeID, const uint8_t * payload, size_t len);
 
 		private:
 
@@ -147,18 +163,21 @@ namespace i2p
 
 			i2p::data::RouterInfo m_RouterInfo;
 			i2p::data::PrivateKeys m_Keys;
-			std::shared_ptr<i2p::crypto::CryptoKeyDecryptor> m_Decryptor;
+			std::shared_ptr<i2p::crypto::CryptoKeyDecryptor> m_Decryptor, m_TunnelDecryptor;
+			std::shared_ptr<i2p::garlic::RouterIncomingRatchetSession> m_ECIESSession;
 			uint64_t m_LastUpdateTime; // in seconds
 			bool m_AcceptsTunnels, m_IsFloodfill;
 			std::chrono::time_point<std::chrono::steady_clock> m_StartupTime;
 			uint64_t m_BandwidthLimit; // allowed bandwidth
 			int m_ShareRatio;
-			RouterStatus m_Status;
+			RouterStatus m_Status, m_StatusV6;
 			RouterError m_Error;
 			int m_NetID;
 			std::mutex m_GarlicMutex;
 			std::unique_ptr<NTCP2PrivateKeys> m_NTCP2Keys;
 			std::unique_ptr<i2p::crypto::X25519Keys> m_StaticKeys;
+			// for ECIESx25519
+			std::unique_ptr<i2p::crypto::NoiseSymmetricState> m_InitialNoiseState, m_CurrentNoiseState;
 	};
 
 	extern RouterContext context;

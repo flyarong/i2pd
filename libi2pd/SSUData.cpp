@@ -7,7 +7,6 @@
 */
 
 #include <stdlib.h>
-#include <boost/bind.hpp>
 #include "Log.h"
 #include "Timestamp.h"
 #include "NetDb.hpp"
@@ -186,7 +185,12 @@ namespace transport
 					std::unique_ptr<IncompleteMessage>(new IncompleteMessage (msg)))).first;
 			}
 			std::unique_ptr<IncompleteMessage>& incompleteMessage = it->second;
-
+			// mark fragment as received
+			if (fragmentNum < 64)
+				incompleteMessage->receivedFragmentsBits |= (0x01 << fragmentNum);
+			else
+				LogPrint (eLogWarning, "SSU: Fragment number ", fragmentNum, " exceeds 64");
+			
 			// handle current fragment
 			if (fragmentNum == incompleteMessage->nextFragmentNum)
 			{
@@ -221,7 +225,7 @@ namespace transport
 					// missing fragment
 					LogPrint (eLogWarning, "SSU: Missing fragments from ", (int)incompleteMessage->nextFragmentNum, " to ", fragmentNum - 1, " of message ", msgID);
 					auto savedFragment = new Fragment (fragmentNum, buf, fragmentSize, isLast);
-					if (incompleteMessage->savedFragments.insert (std::unique_ptr<Fragment>(savedFragment)).second)
+					if (incompleteMessage->savedFragments.insert (std::unique_ptr<Fragment>(savedFragment)).second)	
 						incompleteMessage->lastFragmentInsertTime = i2p::util::GetSecondsSinceEpoch ();
 					else
 						LogPrint (eLogWarning, "SSU: Fragment ", (int)fragmentNum, " of message ", msgID, " already saved");
@@ -267,7 +271,7 @@ namespace transport
 				}
 			}
 			else
-				SendFragmentAck (msgID, fragmentNum);
+				SendFragmentAck (msgID, incompleteMessage->receivedFragmentsBits);
 			buf += fragmentSize;
 		}
 	}
@@ -301,7 +305,7 @@ namespace transport
 	void SSUData::Send (std::shared_ptr<i2p::I2NPMessage> msg)
 	{
 		uint32_t msgID = msg->ToSSU ();
-		if (m_SentMessages.count (msgID) > 0)
+		if (m_SentMessages.find (msgID) != m_SentMessages.end())
 		{
 			LogPrint (eLogWarning, "SSU: message ", msgID, " already sent");
 			return;
@@ -326,8 +330,7 @@ namespace transport
 		{
 			Fragment * fragment = new Fragment;
 			fragment->fragmentNum = fragmentNum;
-			uint8_t * buf = fragment->buf;
-			uint8_t	* payload = buf + sizeof (SSUHeader);
+			uint8_t	* payload = fragment->buf + sizeof (SSUHeader);
 			*payload = DATA_FLAG_WANT_REPLY; // for compatibility
 			payload++;
 			*payload = 1; // always 1 message fragment per message
@@ -346,14 +349,20 @@ namespace transport
 			payload += 3;
 			memcpy (payload, msgBuf, size);
 
-			size += payload - buf;
-			if (size & 0x0F) // make sure 16 bytes boundary
-				size = ((size >> 4) + 1) << 4; // (/16 + 1)*16
+			size += payload - fragment->buf;
+			uint8_t rem = size & 0x0F;
+			if (rem) // make sure 16 bytes boundary
+			{	
+				auto padding = 16 - rem;
+				memset (fragment->buf + size, 0, padding);
+				size += padding;
+			}	
 			fragment->len = size;
 			fragments.push_back (std::unique_ptr<Fragment> (fragment));
 
 			// encrypt message with session key
-			m_Session.FillHeaderAndEncrypt (PAYLOAD_TYPE_DATA, buf, size);
+			uint8_t buf[SSU_V4_MAX_PACKET_SIZE + 18];
+			m_Session.FillHeaderAndEncrypt (PAYLOAD_TYPE_DATA, fragment->buf, size, buf);
 			try
 			{
 				m_Session.Send (buf, size);
@@ -390,13 +399,9 @@ namespace transport
 		m_Session.Send (buf, 48);
 	}
 
-	void SSUData::SendFragmentAck (uint32_t msgID, int fragmentNum)
+	void SSUData::SendFragmentAck (uint32_t msgID, uint64_t bits)
 	{
-		if (fragmentNum > 64)
-		{
-			LogPrint (eLogWarning, "SSU: Fragment number ", fragmentNum, " exceeds 64");
-			return;
-		}
+		if (!bits) return;
 		uint8_t buf[64 + 18] = {0};
 		uint8_t * payload = buf + sizeof (SSUHeader);
 		*payload = DATA_FLAG_ACK_BITFIELDS_INCLUDED; // flag
@@ -406,14 +411,16 @@ namespace transport
 		// one ack
 		*(uint32_t *)(payload) = htobe32 (msgID); // msgID
 		payload += 4;
-		div_t d = div (fragmentNum, 7);
-		memset (payload, 0x80, d.quot); // 0x80 means non-last
-		payload += d.quot;
-		*payload = 0x01 << d.rem; // set corresponding bit
-		payload++;
+		size_t len = 0; 
+		while (bits)
+		{
+			*payload = (bits & 0x7F); // next 7 bits
+			bits >>= 7;
+			if (bits) *payload &= 0x80; // 0x80 means non-last
+			payload++; len++;
+		}	
 		*payload = 0; // number of fragments
-
-		size_t len = d.quot < 4 ? 48 : 64; // 48 = 37 + 7 + 4 (3+1)
+		len = (len <= 4) ? 48 : 64; // 48 = 37 + 7 + 4
 		// encrypt message with session key
 		m_Session.FillHeaderAndEncrypt (PAYLOAD_TYPE_DATA, buf, len);
 		m_Session.Send (buf, len);
@@ -432,6 +439,7 @@ namespace transport
 	{
 		if (ecode != boost::asio::error::operation_aborted)
 		{
+			uint8_t buf[SSU_V4_MAX_PACKET_SIZE + 18];
 			uint32_t ts = i2p::util::GetSecondsSinceEpoch ();
 			int numResent = 0;
 			for (auto it = m_SentMessages.begin (); it != m_SentMessages.end ();)
@@ -444,8 +452,9 @@ namespace transport
 							if (f)
 							{
 								try
-								{
-									m_Session.Send (f->buf, f->len); // resend
+								{					
+									m_Session.FillHeaderAndEncrypt (PAYLOAD_TYPE_DATA, f->buf, f->len, buf);
+									m_Session.Send (buf, f->len); // resend
 									numResent++;
 								}
 								catch (boost::system::system_error& ec)

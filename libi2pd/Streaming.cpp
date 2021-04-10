@@ -21,10 +21,18 @@ namespace stream
 {
 	void SendBufferQueue::Add (const uint8_t * buf, size_t len, SendHandler handler)
 	{
-		m_Buffers.push_back (std::make_shared<SendBuffer>(buf, len, handler));
-		m_Size += len;
+		Add (std::make_shared<SendBuffer>(buf, len, handler));
 	}
 
+	void SendBufferQueue::Add (std::shared_ptr<SendBuffer> buf)
+	{
+		if (buf)
+		{	
+			m_Buffers.push_back (buf);
+			m_Size += buf->len;
+		}	
+	}	
+	
 	size_t SendBufferQueue::Get (uint8_t * buf, size_t len)
 	{
 		size_t offset = 0;
@@ -325,7 +333,7 @@ namespace stream
 		if (flags & PACKET_FLAG_SIGNATURE_INCLUDED)
 		{
 			uint8_t signature[256];
-			auto signatureLen = m_RemoteIdentity->GetSignatureLen ();
+			auto signatureLen = m_TransientVerifier ? m_TransientVerifier->GetSignatureLen () : m_RemoteIdentity->GetSignatureLen ();
 			if(signatureLen <= sizeof(signature))
 			{
 				memcpy (signature, optionData, signatureLen);
@@ -351,6 +359,28 @@ namespace stream
 		return true;
 	}
 
+	void Stream::HandlePing (Packet * packet)
+	{
+		uint16_t flags = packet->GetFlags ();
+		if (ProcessOptions (flags, packet) && m_RemoteIdentity)
+		{
+			// send pong
+			Packet p;
+			memset (p.buf, 0, 22); // minimal header all zeroes
+			memcpy (p.buf + 4, packet->buf, 4); // but receiveStreamID is the sendStreamID from the ping
+			htobe16buf (p.buf + 18, PACKET_FLAG_ECHO); // and echo flag
+			ssize_t payloadLen = packet->len - (packet->GetPayload () - packet->buf);
+			if (payloadLen > 0)
+				memcpy (p.buf + 22, packet->GetPayload (), payloadLen);
+			else
+				payloadLen = 0;
+			p.len = payloadLen + 22;
+			SendPackets (std::vector<Packet *> { &p });
+			LogPrint (eLogDebug, "Streaming: Pong of ", p.len, " bytes sent");
+		}	
+		m_LocalDestination.DeletePacket (packet);
+	}	
+		
 	void Stream::ProcessAck (Packet * packet)
 	{
 		bool acknowledged = false;
@@ -609,6 +639,7 @@ namespace stream
 			packet[size] = 0;
 			size++; // NACK count
 		}
+		packet[size] = 0;
 		size++; // resend delay
 		htobuf16 (packet + size, 0); // no flags set
 		size += 2; // flags
@@ -666,10 +697,11 @@ namespace stream
 		size += 4; // ack Through
 		packet[size] = 0;
 		size++; // NACK count
+		packet[size] = 0;
 		size++; // resend delay
 		htobe16buf (packet + size, PACKET_FLAG_CLOSE | PACKET_FLAG_SIGNATURE_INCLUDED);
 		size += 2; // flags
-		size_t signatureLen = m_LocalDestination.GetOwner ()->GetIdentity ()->GetSignatureLen ();
+		size_t signatureLen = m_LocalDestination.GetOwner ()->GetPrivateKeys ().GetSignatureLen ();
 		htobe16buf (packet + size, signatureLen); // signature only
 		size += 2; // options size
 		uint8_t * signature = packet + size;
@@ -732,7 +764,7 @@ namespace stream
 				return;
 			}
 		}
-		if (!m_RoutingSession || !m_RoutingSession->GetOwner ()) // expired and detached
+		if (!m_RoutingSession || m_RoutingSession->IsTerminated () || !m_RoutingSession->IsReadyToSend ()) // expired and detached or new session sent
 			m_RoutingSession = m_LocalDestination.GetOwner ()->GetRoutingSession (m_RemoteLeaseSet, true);
 		if (!m_CurrentOutboundTunnel && m_RoutingSession) // first message to send
 		{
@@ -785,7 +817,7 @@ namespace stream
 
 	void Stream::SendUpdatedLeaseSet ()
 	{
-		if (m_RoutingSession)
+		if (m_RoutingSession && !m_RoutingSession->IsTerminated ())
 		{
 			if (m_RoutingSession->IsLeaseSetNonConfirmed ())
 			{
@@ -806,6 +838,8 @@ namespace stream
 				SendQuickAck ();
 			}
 		}
+		else
+			SendQuickAck ();
 	}
 
 	void Stream::ScheduleResend ()
@@ -1016,6 +1050,13 @@ namespace stream
 			auto it = m_Streams.find (sendStreamID);
 			if (it != m_Streams.end ())
 				it->second->HandleNextPacket (packet);
+			else if (packet->IsEcho () && m_Owner->IsStreamingAnswerPings ())
+			{
+				// ping
+				LogPrint (eLogInfo, "Streaming: Ping received sSID=", sendStreamID);
+				auto s = std::make_shared<Stream> (m_Owner->GetService (), *this);
+				s->HandlePing (packet);
+			}		
 			else
 			{
 				LogPrint (eLogInfo, "Streaming: Unknown stream sSID=", sendStreamID);

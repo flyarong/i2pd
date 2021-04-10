@@ -11,6 +11,7 @@ ENV REPO_URL=${REPO_URL}
 
 ENV I2PD_HOME="/home/i2pd"
 ENV DATA_DIR="${I2PD_HOME}/data"
+ENV DEFAULT_ARGS=" --datadir=$DATA_DIR --reseed.verify=true --upnp.enabled=false --http.enabled=true --http.address=0.0.0.0 --httpproxy.enabled=true --httpproxy.address=0.0.0.0 --socksproxy.enabled=true --socksproxy.address=0.0.0.0 --sam.enabled=true --sam.address=0.0.0.0"
 
 RUN mkdir -p "$I2PD_HOME" "$DATA_DIR" \
     && adduser -S -h "$I2PD_HOME" i2pd \
@@ -36,7 +37,7 @@ RUN apk --no-cache --virtual build-dependendencies add make gcc g++ libtool zlib
     && cd /usr/local/bin \
     && strip i2pd \
     && rm -fr /tmp/build && apk --no-cache --purge del build-dependendencies build-base fortify-headers boost-dev zlib-dev openssl-dev \
-    boost-python3 python3 gdbm boost-unit_test_framework boost-python2 linux-headers boost-prg_exec_monitor \
+    boost-python3 python3 gdbm boost-unit_test_framework linux-headers boost-prg_exec_monitor \
     boost-serialization boost-wave boost-wserialization boost-math boost-graph boost-regex git pcre2 \
     libtool g++ gcc
 

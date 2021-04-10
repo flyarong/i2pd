@@ -39,40 +39,9 @@ namespace transport
 		delete[] m_SessionConfirmedBuffer;
 	}
 
-	void NTCP2Establisher::MixKey (const uint8_t * inputKeyMaterial)
-	{
-		i2p::crypto::HKDF (m_CK, inputKeyMaterial, 32, "", m_CK);
-		// ck is m_CK[0:31], k is m_CK[32:63]
-	}
-
-	void NTCP2Establisher::MixHash (const uint8_t * buf, size_t len)
-	{
-		SHA256_CTX ctx;
-		SHA256_Init (&ctx);
-		SHA256_Update (&ctx, m_H, 32);
-		SHA256_Update (&ctx, buf, len);
-		SHA256_Final (m_H, &ctx);
-	}
-
 	void NTCP2Establisher::KeyDerivationFunction1 (const uint8_t * pub, i2p::crypto::X25519Keys& priv, const uint8_t * rs, const uint8_t * epub)
 	{
-		static const uint8_t protocolNameHash[] =
-		{
-			0x72, 0xe8, 0x42, 0xc5, 0x45, 0xe1, 0x80, 0x80, 0xd3, 0x9c, 0x44, 0x93, 0xbb, 0x91, 0xd7, 0xed,
-			0xf2, 0x28, 0x98, 0x17, 0x71, 0x21, 0x8c, 0x1f, 0x62, 0x4e, 0x20, 0x6f, 0x28, 0xd3, 0x2f, 0x71
-		}; // SHA256 ("Noise_XKaesobfse+hs2+hs3_25519_ChaChaPoly_SHA256")
-		static const uint8_t hh[32] =
-		{
-			0x49, 0xff, 0x48, 0x3f, 0xc4, 0x04, 0xb9, 0xb2, 0x6b, 0x11, 0x94, 0x36, 0x72, 0xff, 0x05, 0xb5,
-			0x61, 0x27, 0x03, 0x31, 0xba, 0x89, 0xb8, 0xfc, 0x33, 0x15, 0x93, 0x87, 0x57, 0xdd, 0x3d, 0x1e
-		}; // SHA256 (protocolNameHash)
-		memcpy (m_CK, protocolNameHash, 32);
-		// h = SHA256(hh || rs)
-		SHA256_CTX ctx;
-		SHA256_Init (&ctx);
-		SHA256_Update (&ctx, hh, 32);
-		SHA256_Update (&ctx, rs, 32);
-		SHA256_Final (m_H, &ctx);
+		i2p::crypto::InitNoiseXKState (*this, rs);
 		// h = SHA256(h || epub)
 		MixHash (epub, 32);
 		// x25519 between pub and priv
@@ -83,7 +52,7 @@ namespace transport
 
 	void NTCP2Establisher::KDF1Alice ()
 	{
-		KeyDerivationFunction1 (m_RemoteStaticKey, m_EphemeralKeys, m_RemoteStaticKey, GetPub ());
+		KeyDerivationFunction1 (m_RemoteStaticKey, *m_EphemeralKeys, m_RemoteStaticKey, GetPub ());
 	}
 
 	void NTCP2Establisher::KDF1Bob ()
@@ -102,7 +71,7 @@ namespace transport
 
 		// x25519 between remote pub and ephemaral priv
 		uint8_t inputKeyMaterial[32];
-		m_EphemeralKeys.Agree (GetRemotePub (), inputKeyMaterial);
+		m_EphemeralKeys->Agree (GetRemotePub (), inputKeyMaterial);
 
 		MixKey (inputKeyMaterial);
 	}
@@ -127,13 +96,13 @@ namespace transport
 	void NTCP2Establisher::KDF3Bob ()
 	{
 		uint8_t inputKeyMaterial[32];
-		m_EphemeralKeys.Agree (m_RemoteStaticKey, inputKeyMaterial);
+		m_EphemeralKeys->Agree (m_RemoteStaticKey, inputKeyMaterial);
 		MixKey (inputKeyMaterial);
 	}
 
 	void NTCP2Establisher::CreateEphemeralKey ()
 	{
-		m_EphemeralKeys.GenerateKeys ();
+		m_EphemeralKeys = i2p::transport::transports.GetNextX25519KeysPair ();
 	}
 
 	void NTCP2Establisher::CreateSessionRequestMessage ()
@@ -338,11 +307,8 @@ namespace transport
 
 		KDF3Bob ();
 		if (i2p::crypto::AEADChaCha20Poly1305 (m_SessionConfirmedBuffer + 48, m3p2Len - 16, GetH (), 32, GetK (), nonce, m3p2Buf, m3p2Len - 16, false)) // decrypt
-		{
 			// caclulate new h again for KDF data
-			memcpy (m_SessionConfirmedBuffer + 16, m_H, 32); // h || ciphertext
-			SHA256 (m_SessionConfirmedBuffer + 16, m3p2Len + 32, m_H); //h = SHA256(h || ciphertext);
-		}
+			MixHash (m_SessionConfirmedBuffer + 48, m3p2Len); // h = SHA256(h || ciphertext)
 		else
 		{
 			LogPrint (eLogWarning, "NTCP2: SessionConfirmed Part2 AEAD verification failed ");
@@ -351,7 +317,8 @@ namespace transport
 		return true;
 	}
 
-	NTCP2Session::NTCP2Session (NTCP2Server& server, std::shared_ptr<const i2p::data::RouterInfo> in_RemoteRouter):
+	NTCP2Session::NTCP2Session (NTCP2Server& server, std::shared_ptr<const i2p::data::RouterInfo> in_RemoteRouter,
+	    	std::shared_ptr<const i2p::data::RouterInfo::Address> addr):
 		TransportSession (in_RemoteRouter, NTCP2_ESTABLISH_TIMEOUT),
 		m_Server (server), m_Socket (m_Server.GetService ()),
 		m_IsEstablished (false), m_IsTerminated (false),
@@ -366,15 +333,17 @@ namespace transport
 		if (in_RemoteRouter) // Alice
 		{
 			m_Establisher->m_RemoteIdentHash = GetRemoteIdentity ()->GetIdentHash ();
-			auto addr = in_RemoteRouter->GetNTCP2Address (true); // we need a published address
 			if (addr)
 			{
 				memcpy (m_Establisher->m_RemoteStaticKey, addr->ntcp2->staticKey, 32);
 				memcpy (m_Establisher->m_IV, addr->ntcp2->iv, 16);
+				m_RemoteEndpoint = boost::asio::ip::tcp::endpoint (addr->host, addr->port);
 			}
 			else
-				LogPrint (eLogWarning, "NTCP2: Missing NTCP2 parameters");
+				LogPrint (eLogWarning, "NTCP2: Missing NTCP2 address");
 		}
+		m_NextRouterInfoResendTime = i2p::util::GetSecondsSinceEpoch () + NTCP2_ROUTERINFO_RESEND_INTERVAL + 
+			rand ()%NTCP2_ROUTERINFO_RESEND_INTERVAL_THRESHOLD;
 	}
 
 	NTCP2Session::~NTCP2Session ()
@@ -687,17 +656,11 @@ namespace transport
 						SendTerminationAndTerminate (eNTCP2Message3Error);
 						return;
 					}
-					auto addr = ri.GetNTCP2Address (false); // any NTCP2 address
+					auto addr = ri.GetNTCP2AddressWithStaticKey (m_Establisher->m_RemoteStaticKey);
 					if (!addr)
 					{
-						LogPrint (eLogError, "NTCP2: No NTCP2 address found in SessionConfirmed");
+						LogPrint (eLogError, "NTCP2: No NTCP2 address wth static key found in SessionConfirmed");
 						Terminate ();
-						return;
-					}
-					if (memcmp (addr->ntcp2->staticKey, m_Establisher->m_RemoteStaticKey, 32))
-					{
-						LogPrint (eLogError, "NTCP2: Static key mismatch in SessionConfirmed");
-						SendTerminationAndTerminate (eNTCP2IncorrectSParameter);
 						return;
 					}
 					i2p::data::netdb.PostI2NPMsg (CreateI2NPMessage (eI2NPDummyMsg, buf.data () + 3, size)); // TODO: should insert ri and not parse it twice
@@ -760,6 +723,10 @@ namespace transport
 	void NTCP2Session::ReceiveLength ()
 	{
 		if (IsTerminated ()) return;
+#ifdef __linux__
+		const int one = 1;
+    	setsockopt(m_Socket.native_handle(), IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+#endif		
 		boost::asio::async_read (m_Socket, boost::asio::buffer(&m_NextReceivedLen, 2), boost::asio::transfer_all (),
 			std::bind(&NTCP2Session::HandleReceivedLength, shared_from_this (), std::placeholders::_1, std::placeholders::_2));
 	}
@@ -811,6 +778,10 @@ namespace transport
 	void NTCP2Session::Receive ()
 	{
 		if (IsTerminated ()) return;
+#ifdef __linux__
+		const int one = 1;
+    	setsockopt(m_Socket.native_handle(), IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+#endif			
 		boost::asio::async_read (m_Socket, boost::asio::buffer(m_NextReceivedBuffer, m_NextReceivedLen), boost::asio::transfer_all (),
 			std::bind(&NTCP2Session::HandleReceived, shared_from_this (), std::placeholders::_1, std::placeholders::_2));
 	}
@@ -1036,7 +1007,14 @@ namespace transport
 			m_NumSentBytes += bytes_transferred;
 			i2p::transport::transports.UpdateSentBytes (bytes_transferred);
 			LogPrint (eLogDebug, "NTCP2: Next frame sent ", bytes_transferred);
-			SendQueue ();
+			if (m_LastActivityTimestamp > m_NextRouterInfoResendTime)
+			{
+				m_NextRouterInfoResendTime += NTCP2_ROUTERINFO_RESEND_INTERVAL + 
+					rand ()%NTCP2_ROUTERINFO_RESEND_INTERVAL_THRESHOLD;
+				SendRouterInfo ();		
+			}	
+			else	
+				SendQueue ();
 		}
 	}
 
@@ -1180,52 +1158,58 @@ namespace transport
 				}
 			}
 			else
-			{
 				LogPrint(eLogInfo, "NTCP2: Proxy is not used");
-				auto& addresses = context.GetRouterInfo ().GetAddresses ();
-				for (const auto& address: addresses)
+			// start acceptors
+			auto& addresses = context.GetRouterInfo ().GetAddresses ();
+			for (const auto& address: addresses)
+			{
+				if (!address) continue;
+				if (address->IsPublishedNTCP2 () && address->port)
 				{
-					if (!address) continue;
-					if (address->IsPublishedNTCP2 ())
+					if (address->host.is_v4())
 					{
-						if (address->host.is_v4())
+						try
 						{
-							try
-							{
-								m_NTCP2Acceptor.reset (new boost::asio::ip::tcp::acceptor (GetService (), boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), address->port)));
-							}
-							catch ( std::exception & ex )
-							{
-								LogPrint(eLogError, "NTCP2: Failed to bind to v4 port ", address->port, ex.what());
-								ThrowFatal ("Unable to start IPv4 NTCP2 transport at port ", address->port, ": ", ex.what ());
-								continue;
-							}
-
-							LogPrint (eLogInfo, "NTCP2: Start listening v4 TCP port ", address->port);
-							auto conn = std::make_shared<NTCP2Session>(*this);
-							m_NTCP2Acceptor->async_accept(conn->GetSocket (), std::bind (&NTCP2Server::HandleAccept, this, conn, std::placeholders::_1));
+							auto ep = m_Address4 ? boost::asio::ip::tcp::endpoint (m_Address4->address(), address->port):
+								boost::asio::ip::tcp::endpoint (boost::asio::ip::tcp::v4(), address->port);
+							m_NTCP2Acceptor.reset (new boost::asio::ip::tcp::acceptor (GetService (), ep));
 						}
-						else if (address->host.is_v6() && context.SupportsV6 ())
+						catch ( std::exception & ex )
 						{
-							m_NTCP2V6Acceptor.reset (new boost::asio::ip::tcp::acceptor (GetService ()));
-							try
-							{
-								m_NTCP2V6Acceptor->open (boost::asio::ip::tcp::v6());
-								m_NTCP2V6Acceptor->set_option (boost::asio::ip::v6_only (true));
-								m_NTCP2V6Acceptor->set_option (boost::asio::socket_base::reuse_address (true));
-								m_NTCP2V6Acceptor->bind (boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v6(), address->port));
-								m_NTCP2V6Acceptor->listen ();
+							LogPrint(eLogError, "NTCP2: Failed to bind to v4 port ", address->port, ex.what());
+							ThrowFatal ("Unable to start IPv4 NTCP2 transport at port ", address->port, ": ", ex.what ());
+							continue;
+						}
 
-								LogPrint (eLogInfo, "NTCP2: Start listening v6 TCP port ", address->port);
-								auto conn = std::make_shared<NTCP2Session> (*this);
-								m_NTCP2V6Acceptor->async_accept(conn->GetSocket (), std::bind (&NTCP2Server::HandleAcceptV6, this, conn, std::placeholders::_1));
-							}
-							catch ( std::exception & ex )
-							{
-								LogPrint(eLogError, "NTCP2: failed to bind to v6 port ", address->port, ": ", ex.what());
-								ThrowFatal ("Unable to start IPv6 NTCP2 transport at port ", address->port, ": ", ex.what ());
-								continue;
-							}
+						LogPrint (eLogInfo, "NTCP2: Start listening v4 TCP port ", address->port);
+						auto conn = std::make_shared<NTCP2Session>(*this);
+						m_NTCP2Acceptor->async_accept(conn->GetSocket (), std::bind (&NTCP2Server::HandleAccept, this, conn, std::placeholders::_1));
+					}
+					else if (address->host.is_v6() && (context.SupportsV6 () || context.SupportsMesh ()))
+					{
+						m_NTCP2V6Acceptor.reset (new boost::asio::ip::tcp::acceptor (GetService ()));
+						try
+						{
+							m_NTCP2V6Acceptor->open (boost::asio::ip::tcp::v6());
+							m_NTCP2V6Acceptor->set_option (boost::asio::ip::v6_only (true));
+							m_NTCP2V6Acceptor->set_option (boost::asio::socket_base::reuse_address (true));
+							auto ep = boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v6(), address->port);
+							if (m_Address6 && !context.SupportsMesh ())
+								ep = boost::asio::ip::tcp::endpoint (m_Address6->address(), address->port);
+							else if (m_YggdrasilAddress && !context.SupportsV6 ())
+								ep = boost::asio::ip::tcp::endpoint (m_YggdrasilAddress->address(), address->port);
+							m_NTCP2V6Acceptor->bind (ep);
+							m_NTCP2V6Acceptor->listen ();
+
+							LogPrint (eLogInfo, "NTCP2: Start listening v6 TCP port ", address->port);
+							auto conn = std::make_shared<NTCP2Session> (*this);
+							m_NTCP2V6Acceptor->async_accept(conn->GetSocket (), std::bind (&NTCP2Server::HandleAcceptV6, this, conn, std::placeholders::_1));
+						}
+						catch ( std::exception & ex )
+						{
+							LogPrint(eLogError, "NTCP2: failed to bind to v6 port ", address->port, ": ", ex.what());
+							ThrowFatal ("Unable to start IPv6 NTCP2 transport at port ", address->port, ": ", ex.what ());
+							continue;
 						}
 					}
 				}
@@ -1289,10 +1273,15 @@ namespace transport
 		return nullptr;
 	}
 
-	void NTCP2Server::Connect(const boost::asio::ip::address & address, uint16_t port, std::shared_ptr<NTCP2Session> conn)
+	void NTCP2Server::Connect(std::shared_ptr<NTCP2Session> conn)
 	{
-		LogPrint (eLogDebug, "NTCP2: Connecting to ", address ,":",  port);
-		GetService ().post([this, address, port, conn]()
+		if (!conn || conn->GetRemoteEndpoint ().address ().is_unspecified ())
+		{
+			LogPrint (eLogError, "NTCP2: Can't connect to unspecified address");
+			return;
+		}	
+		LogPrint (eLogDebug, "NTCP2: Connecting to ", conn->GetRemoteEndpoint ());
+		GetService ().post([this, conn]()
 			{
 				if (this->AddNTCP2Session (conn))
 				{
@@ -1305,11 +1294,32 @@ namespace transport
 						if (ecode != boost::asio::error::operation_aborted)
 						{
 							LogPrint (eLogInfo, "NTCP2: Not connected in ", timeout, " seconds");
-							//i2p::data::netdb.SetUnreachable (conn->GetRemoteIdentity ()->GetIdentHash (), true);
 							conn->Terminate ();
 						}
 					});
-					conn->GetSocket ().async_connect (boost::asio::ip::tcp::endpoint (address, port), std::bind (&NTCP2Server::HandleConnect, this, std::placeholders::_1, conn, timer));
+					// bind to local address
+					std::shared_ptr<boost::asio::ip::tcp::endpoint> localAddress;
+					if (conn->GetRemoteEndpoint ().address ().is_v6 ())
+					{	
+						if (i2p::util::net::IsYggdrasilAddress (conn->GetRemoteEndpoint ().address ()))
+							localAddress = m_YggdrasilAddress;
+						else 
+							localAddress = m_Address6;
+						conn->GetSocket ().open (boost::asio::ip::tcp::v6 ());
+					}	
+					else
+					{	
+						localAddress = m_Address4;
+						conn->GetSocket ().open (boost::asio::ip::tcp::v4 ());
+					}	
+					if (localAddress)
+					{
+						boost::system::error_code ec;
+						conn->GetSocket ().bind (*localAddress, ec);
+						if (ec)
+							LogPrint (eLogError, "NTCP2: can't bind to ", localAddress->address ().to_string (), ": ", ec.message ());	
+					}	
+					conn->GetSocket ().async_connect (conn->GetRemoteEndpoint (), std::bind (&NTCP2Server::HandleConnect, this, std::placeholders::_1, conn, timer));
 				}
 				else
 					conn->Terminate ();
@@ -1326,7 +1336,7 @@ namespace transport
 		}
 		else
 		{
-			LogPrint (eLogDebug, "NTCP2: Connected to ", conn->GetSocket ().remote_endpoint ());
+			LogPrint (eLogDebug, "NTCP2: Connected to ", conn->GetRemoteEndpoint ());
 			conn->ClientLogin ();
 		}
 	}
@@ -1342,6 +1352,7 @@ namespace transport
 				LogPrint (eLogDebug, "NTCP2: Connected from ", ep);
 				if (conn)
 				{
+					conn->SetRemoteEndpoint (ep);
 					conn->ServerLogin ();
 					m_PendingIncomingSessions.push_back (conn);
 					conn = nullptr;
@@ -1375,6 +1386,7 @@ namespace transport
 				LogPrint (eLogDebug, "NTCP2: Connected from ", ep);
 				if (conn)
 				{
+					conn->SetRemoteEndpoint (ep);
 					conn->ServerLogin ();
 					m_PendingIncomingSessions.push_back (conn);
 				}
@@ -1429,15 +1441,20 @@ namespace transport
 		}
 	}
 
-	void NTCP2Server::ConnectWithProxy (const std::string& host, uint16_t port, RemoteAddressType addrtype, std::shared_ptr<NTCP2Session> conn)
+	void NTCP2Server::ConnectWithProxy (std::shared_ptr<NTCP2Session> conn)
 	{
 		if(!m_ProxyEndpoint) return;
-		GetService().post([this, host, port, addrtype, conn]() {
+		if (!conn || conn->GetRemoteEndpoint ().address ().is_unspecified ())
+		{
+			LogPrint (eLogError, "NTCP2: Can't connect to unspecified address");
+			return;
+		}	
+		GetService().post([this, conn]() 
+		{
 			if (this->AddNTCP2Session (conn))
 			{
-
 				auto timer = std::make_shared<boost::asio::deadline_timer>(GetService());
-				auto timeout = NTCP_CONNECT_TIMEOUT * 5;
+				auto timeout = NTCP2_CONNECT_TIMEOUT * 5;
 				conn->SetTerminationTimeout(timeout * 2);
 				timer->expires_from_now (boost::posix_time::seconds(timeout));
 				timer->async_wait ([conn, timeout](const boost::system::error_code& ecode)
@@ -1445,23 +1462,25 @@ namespace transport
 					if (ecode != boost::asio::error::operation_aborted)
 					{
 						LogPrint (eLogInfo, "NTCP2: Not connected in ", timeout, " seconds");
-						i2p::data::netdb.SetUnreachable (conn->GetRemoteIdentity ()->GetIdentHash (), true);
 						conn->Terminate ();
 					}
 				});
-				conn->GetSocket ().async_connect (*m_ProxyEndpoint, std::bind (&NTCP2Server::HandleProxyConnect, this, std::placeholders::_1, conn, timer, host, port, addrtype));
+				conn->GetSocket ().async_connect (*m_ProxyEndpoint, std::bind (&NTCP2Server::HandleProxyConnect, this, std::placeholders::_1, conn, timer));
 			}
 		});
 	}
 
-	void NTCP2Server::UseProxy(ProxyType proxytype, const std::string & addr, uint16_t port)
+	void NTCP2Server::UseProxy(ProxyType proxytype, const std::string& addr, uint16_t port,
+		const std::string& user, const std::string& pass)
 	{
 		m_ProxyType = proxytype;
 		m_ProxyAddress = addr;
 		m_ProxyPort = port;
+		if (m_ProxyType == eHTTPProxy )
+			m_ProxyAuthorization = i2p::http::CreateBasicAuthorizationString (user, pass);
 	}
 
-	void NTCP2Server::HandleProxyConnect(const boost::system::error_code& ecode, std::shared_ptr<NTCP2Session> conn, std::shared_ptr<boost::asio::deadline_timer> timer, const std::string & host, uint16_t port, RemoteAddressType addrtype)
+	void NTCP2Server::HandleProxyConnect(const boost::system::error_code& ecode, std::shared_ptr<NTCP2Session> conn, std::shared_ptr<boost::asio::deadline_timer> timer)
 	{
 		if (ecode)
 		{
@@ -1487,7 +1506,7 @@ namespace transport
 					});
 				auto readbuff = std::make_shared<std::vector<uint8_t> >(2);
 				boost::asio::async_read(conn->GetSocket(), boost::asio::buffer(readbuff->data (), 2),
-					[this, readbuff, timer, conn, host, port, addrtype](const boost::system::error_code & ec, std::size_t transferred)
+					[this, readbuff, timer, conn](const boost::system::error_code & ec, std::size_t transferred)
 					{
 						if(ec)
 						{
@@ -1500,7 +1519,7 @@ namespace transport
 						{
 							if((*readbuff)[1] == 0x00)
 							{
-								AfterSocksHandshake(conn, timer, host, port, addrtype);
+								AfterSocksHandshake(conn, timer);
 								return;
 							}
 							else if ((*readbuff)[1] == 0xff)
@@ -1520,14 +1539,17 @@ namespace transport
 			}
 			case eHTTPProxy:
 			{
+				auto& ep = conn->GetRemoteEndpoint ();
 				i2p::http::HTTPReq req;
 				req.method = "CONNECT";
 				req.version ="HTTP/1.1";
-				if(addrtype == eIP6Address)
-					req.uri = "[" + host + "]:" + std::to_string(port);
+				if(ep.address ().is_v6 ())
+					req.uri = "[" + ep.address ().to_string() + "]:" + std::to_string(ep.port ());
 				else
-					req.uri = host + ":" + std::to_string(port);
-
+					req.uri = ep.address ().to_string() + ":" + std::to_string(ep.port ());	
+				if (!m_ProxyAuthorization.empty ())
+					req.AddHeader("Proxy-Authorization", m_ProxyAuthorization);
+				
 				boost::asio::streambuf writebuff;
 				std::ostream out(&writebuff);
 				out << req.to_string();
@@ -1542,7 +1564,7 @@ namespace transport
 
 				boost::asio::streambuf * readbuff = new boost::asio::streambuf;
 				boost::asio::async_read_until(conn->GetSocket(), *readbuff, "\r\n\r\n",
-					[this, readbuff, timer, conn] (const boost::system::error_code & ec, std::size_t transferred)
+					[readbuff, timer, conn] (const boost::system::error_code & ec, std::size_t transferred)
 					{
 						if(ec)
 						{
@@ -1580,7 +1602,7 @@ namespace transport
 		}
 	}
 
-	void NTCP2Server::AfterSocksHandshake(std::shared_ptr<NTCP2Session> conn, std::shared_ptr<boost::asio::deadline_timer> timer, const std::string & host, uint16_t port, RemoteAddressType addrtype)
+	void NTCP2Server::AfterSocksHandshake(std::shared_ptr<NTCP2Session> conn, std::shared_ptr<boost::asio::deadline_timer> timer)
 	{
 		// build request
 		size_t sz = 6; // header + port
@@ -1590,27 +1612,28 @@ namespace transport
 		(*buff)[1] = 0x01;
 		(*buff)[2] = 0x00;
 
-		if(addrtype == eIP4Address)
+		auto& ep = conn->GetRemoteEndpoint ();
+		if(ep.address ().is_v4 ())
 		{
 			(*buff)[3] = 0x01;
-			auto addrbytes = boost::asio::ip::address::from_string(host).to_v4().to_bytes();
+			auto addrbytes = ep.address ().to_v4().to_bytes();
 			sz += 4;
 			memcpy(buff->data () + 4, addrbytes.data(), 4);
 		}
-		else if (addrtype == eIP6Address)
+		else if (ep.address ().is_v6 ())
 		{
 			(*buff)[3] = 0x04;
-			auto addrbytes = boost::asio::ip::address::from_string(host).to_v6().to_bytes();
+			auto addrbytes = ep.address ().to_v6().to_bytes();
 			sz += 16;
 			memcpy(buff->data () + 4, addrbytes.data(), 16);
 		}
-		else if (addrtype == eHostname)
+		else 
 		{
 			// We mustn't really fall here because all connections are made to IP addresses
-			LogPrint(eLogError, "NTCP2: Tried to connect to domain name via socks proxy");
+			LogPrint(eLogError, "NTCP2: Tried to connect to unexpected address via proxy");
 			return;
 		}
-		htobe16buf(buff->data () + sz - 2, port);
+		htobe16buf(buff->data () + sz - 2, ep.port ());
 		boost::asio::async_write(conn->GetSocket(), boost::asio::buffer(buff->data (), sz), boost::asio::transfer_all(),
 			[buff](const boost::system::error_code & ec, std::size_t written)
 			{
@@ -1637,11 +1660,23 @@ namespace transport
 						return;
 					}
 				}
-				if(!e)
-					i2p::data::netdb.SetUnreachable (conn->GetRemoteIdentity ()->GetIdentHash (), true);
 				timer->cancel();
 				conn->Terminate();
 			});
 	}
+
+	void NTCP2Server::SetLocalAddress (const boost::asio::ip::address& localAddress)
+	{	
+		auto addr = std::make_shared<boost::asio::ip::tcp::endpoint>(boost::asio::ip::tcp::endpoint(localAddress, 0));
+		if (localAddress.is_v6 ())
+		{	
+			if (i2p::util::net::IsYggdrasilAddress (localAddress))
+				m_YggdrasilAddress = addr;
+			else 
+				m_Address6 = addr;
+		}	
+		else
+			m_Address4 = addr;
+	}	
 }
 }

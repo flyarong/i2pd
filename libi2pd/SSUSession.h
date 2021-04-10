@@ -138,12 +138,15 @@ namespace transport
 			void FillHeaderAndEncrypt (uint8_t payloadType, uint8_t * buf, size_t len, const i2p::crypto::AESKey& aesKey,
 				const uint8_t * iv, const i2p::crypto::MACKey& macKey, uint8_t flag = 0);
 			void FillHeaderAndEncrypt (uint8_t payloadType, uint8_t * buf, size_t len); // with session key
+			void FillHeaderAndEncrypt (uint8_t payloadType, uint8_t * in, size_t len, uint8_t * out); // with session key
 			void Decrypt (uint8_t * buf, size_t len, const i2p::crypto::AESKey& aesKey);
 			void DecryptSessionKey (uint8_t * buf, size_t len);
 			bool Validate (uint8_t * buf, size_t len, const i2p::crypto::MACKey& macKey);
 
 			void Reset ();
 
+			static size_t ExtractIPAddressAndPort (const uint8_t * buf, size_t len, boost::asio::ip::address& ip, uint16_t& port); // returns actual buf size
+			
 		private:
 
 			friend class SSUData; // TODO: change in later
@@ -165,6 +168,7 @@ namespace transport
 			bool m_IsDataReceived;
 			std::unique_ptr<SignedData> m_SignedData; // we need it for SessionConfirmed only
 			std::map<uint32_t, std::shared_ptr<const i2p::data::RouterInfo> > m_RelayRequests; // nonce->Charlie
+			std::shared_ptr<i2p::crypto::DHKeys> m_DHKeysPair; // X - for client and Y - for server
 	};
 }
 }

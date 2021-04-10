@@ -61,7 +61,7 @@ namespace stream
 	const int SYN_TIMEOUT = 200; // how long we wait for SYN after follow-on, in milliseconds
 	const size_t MAX_PENDING_INCOMING_BACKLOG = 128;
 	const int PENDING_INCOMING_TIMEOUT = 10; // in seconds
-	const int MAX_RECEIVE_TIMEOUT = 30; // in seconds
+	const int MAX_RECEIVE_TIMEOUT = 20; // in seconds
 
 	struct Packet
 	{
@@ -87,6 +87,7 @@ namespace stream
 
 		bool IsSYN () const { return GetFlags () & PACKET_FLAG_SYNCHRONIZE; };
 		bool IsNoAck () const { return GetFlags () & PACKET_FLAG_NO_ACK; };
+		bool IsEcho () const { return GetFlags () & PACKET_FLAG_ECHO; };
 	};
 
 	struct PacketCmp
@@ -110,6 +111,11 @@ namespace stream
 			buf = new uint8_t[len];
 			memcpy (buf, b, len);
 		}
+		SendBuffer (size_t l): // creat empty buffer
+			len(l), offset (0)	
+		{
+			buf = new uint8_t[len];
+		}	
 		~SendBuffer ()
 		{
 			delete[] buf;
@@ -128,6 +134,7 @@ namespace stream
 			~SendBufferQueue () { CleanUp (); };
 
 			void Add (const uint8_t * buf, size_t len, SendHandler handler);
+			void Add (std::shared_ptr<SendBuffer> buf);
 			size_t Get (uint8_t * buf, size_t len);
 			size_t GetSize () const { return m_Size; };
 			bool IsEmpty () const { return m_Buffers.empty (); };
@@ -168,6 +175,7 @@ namespace stream
 			StreamingDestination& GetLocalDestination () { return m_LocalDestination; };
 
 			void HandleNextPacket (Packet * packet);
+			void HandlePing (Packet * packet);
 			size_t Send (const uint8_t * buf, size_t len);
 			void AsyncSend (const uint8_t * buf, size_t len, SendHandler handler);
 

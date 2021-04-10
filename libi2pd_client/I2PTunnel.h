@@ -48,7 +48,8 @@ namespace client
 			~I2PTunnelConnection ();
 			void I2PConnect (const uint8_t * msg = nullptr, size_t len = 0);
 			void Connect (bool isUniqueLocal = true);
-
+			void Connect (const boost::asio::ip::address& localAddress);
+		
 		protected:
 
 			void Terminate ();
@@ -57,7 +58,8 @@ namespace client
 			void HandleReceived (const boost::system::error_code& ecode, std::size_t bytes_transferred);
 			virtual void Write (const uint8_t * buf, size_t len); // can be overloaded
 			void HandleWrite (const boost::system::error_code& ecode);
-
+			virtual void WriteToStream (const uint8_t * buf, size_t len); // can be overloaded
+		
 			void StreamReceive ();
 			void HandleStreamReceive (const boost::system::error_code& ecode, std::size_t bytes_transferred);
 			void HandleConnect (const boost::system::error_code& ecode);
@@ -103,12 +105,13 @@ namespace client
 		protected:
 
 			void Write (const uint8_t * buf, size_t len);
+			void WriteToStream (const uint8_t * buf, size_t len); 
 
 		private:
 
 			std::string m_Host;
 			std::stringstream m_InHeader, m_OutHeader;
-			bool m_HeaderSent;
+			bool m_HeaderSent, m_ResponseHeaderSent;
 			std::shared_ptr<const i2p::data::IdentityEx> m_From;
 	};
 
@@ -165,9 +168,10 @@ namespace client
 
 	/** 2 minute timeout for udp sessions */
 	const uint64_t I2P_UDP_SESSION_TIMEOUT = 1000 * 60 * 2;
-
+	const uint64_t I2P_UDP_REPLIABLE_DATAGRAM_INTERVAL = 100; // in milliseconds	
+	
 	/** max size for i2p udp */
-	const size_t I2P_UDP_MAX_MTU = i2p::datagram::MAX_DATAGRAM_SIZE;
+	const size_t I2P_UDP_MAX_MTU = 64*1024;
 
 	struct UDPSession
 	{
@@ -237,6 +241,7 @@ namespace client
 		private:
 
 			void HandleRecvFromI2P(const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len);
+			void HandleRecvFromI2PRaw (uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len);
 			UDPSessionPtr ObtainUDPSession(const i2p::data::IdentityEx& from, uint16_t localPort, uint16_t remotePort);
 
 		private:
@@ -248,6 +253,7 @@ namespace client
 			std::mutex m_SessionsMutex;
 			std::vector<UDPSessionPtr> m_Sessions;
 			std::shared_ptr<i2p::client::ClientDestination> m_LocalDest;
+			UDPSessionPtr m_LastSession;
 	};
 
 	class I2PUDPClientTunnel
@@ -273,10 +279,14 @@ namespace client
 			void RecvFromLocal();
 			void HandleRecvFromLocal(const boost::system::error_code & e, std::size_t transferred);
 			void HandleRecvFromI2P(const i2p::data::IdentityEx& from, uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len);
+			void HandleRecvFromI2PRaw(uint16_t fromPort, uint16_t toPort, const uint8_t * buf, size_t len);
 			void TryResolving();
+
+		private:
+			
 			const std::string m_Name;
 			std::mutex m_SessionsMutex;
-			std::map<uint16_t, UDPConvo > m_Sessions; // maps i2p port -> local udp convo
+			std::unordered_map<uint16_t, std::shared_ptr<UDPConvo> > m_Sessions; // maps i2p port -> local udp convo
 			const std::string m_RemoteDest;
 			std::shared_ptr<i2p::client::ClientDestination> m_LocalDest;
 			const boost::asio::ip::udp::endpoint m_LocalEndpoint;
@@ -285,8 +295,9 @@ namespace client
 			boost::asio::ip::udp::socket m_LocalSocket;
 			boost::asio::ip::udp::endpoint m_RecvEndpoint;
 			uint8_t m_RecvBuff[I2P_UDP_MAX_MTU];
-			uint16_t RemotePort;
+			uint16_t RemotePort, m_LastPort;
 			bool m_cancel_resolve;
+			std::shared_ptr<UDPConvo> m_LastSession;
 	};
 
 	class I2PServerTunnel: public I2PService
@@ -304,6 +315,8 @@ namespace client
 			void SetUniqueLocal (bool isUniqueLocal) { m_IsUniqueLocal = isUniqueLocal; }
 			bool IsUniqueLocal () const { return m_IsUniqueLocal; }
 
+			void SetLocalAddress (const std::string& localAddress);
+			
 			const std::string& GetAddress() const { return m_Address; }
 			int GetPort () const { return m_Port; };
 			uint16_t GetLocalPort () const { return m_PortDestination->GetLocalPort (); };
@@ -329,6 +342,7 @@ namespace client
 			std::shared_ptr<i2p::stream::StreamingDestination> m_PortDestination;
 			std::set<i2p::data::IdentHash> m_AccessList;
 			bool m_IsAccessList;
+			std::unique_ptr<boost::asio::ip::address> m_LocalAddress;
 	};
 
 	class I2PServerTunnelHTTP: public I2PServerTunnel
